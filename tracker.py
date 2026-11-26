@@ -504,6 +504,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     data = load_prices()
     failures = 0
+    alert_failures = 0
     started = time.monotonic()
     seen: set[str] = set()
     now = datetime.now(IST)
@@ -512,10 +513,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     for i, raw in enumerate(raw_urls):
         try:
             key = normalize_url(raw)
-        except ValueError as exc:
-            log.error("SKIP: %s", exc)
-            failures += 1
-            continue
+        except RuntimeError as exc:
+                # Do NOT store the new price: next run will detect the drop again.
+                log.error("  alert failed, keeping old price so it retries tomorrow: %s", exc)
+                alert_failures += 1
+                continue
         if key in seen:
             continue
         seen.add(key)
@@ -533,7 +535,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         try:
             quote = check_product(key)
         except FetchError as exc:
-            log.error("  FAILED: %s", exc)
+            log.warning("  could not check this product today: %s", exc)
             failures += 1
             continue
         except Exception:  # one bad product must never kill the whole run
@@ -583,8 +585,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         save_prices(data)   # save per product so a crash never loses sent-alert state
 
     save_prices(data)
-    log.info("Done. %d product(s) checked, %d failure(s).", len(seen), failures)
-    return 1 if failures else 0
+    log.info("Done. %d product(s) checked, %d could not be fetched (ignored), %d alert failure(s).",
+             len(seen), failures, alert_failures)
+    return 1 if alert_failures else 0
 
 
 if __name__ == "__main__":
