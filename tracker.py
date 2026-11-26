@@ -50,11 +50,11 @@ PRICES_FILE = BASE_DIR / "prices.json"
 
 MAX_HISTORY = 365            # entries kept per product
 REQUEST_TIMEOUT = 25         # seconds
-MAX_ATTEMPTS = max(1, int(os.environ.get("MAX_ATTEMPTS", "5")))  # per product
+MAX_ATTEMPTS = max(1, int(os.environ.get("MAX_ATTEMPTS", "10")))  # per product
 BACKOFF_BASE = 8             # seconds; doubles every retry (8, 16, 32, 60...)
 BACKOFF_MAX = 60
 TIME_BUDGET = 20 * 60        # stop starting new products after this many seconds
-DELAY_BETWEEN_PRODUCTS = (4, 9)   # random sleep range, seconds
+DELAY_BETWEEN_PRODUCTS = (9, 17)   # random sleep range, seconds
 BIG_DROP_WARN_PCT = 50       # add a "verify" note to alerts for drops this large
 IST = timezone(timedelta(hours=5, minutes=30))
 
