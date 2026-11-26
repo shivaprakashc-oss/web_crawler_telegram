@@ -53,7 +53,7 @@ PRICES_FILE = BASE_DIR / "prices.json"
 
 MAX_HISTORY = 365            # entries kept per product
 REQUEST_TIMEOUT = 25         # seconds
-MAX_ATTEMPTS = max(1, int(os.environ.get("MAX_ATTEMPTS", "12")))  # per product
+MAX_ATTEMPTS = max(1, int(os.environ.get("MAX_ATTEMPTS", "15")))  # per product
 SHORT_WAIT = (3, 7)          # seconds between failed attempts (block is per-request, not rate-based)
 COOLDOWN_EVERY = 4           # after every 4th failure, take a longer pause
 COOLDOWN_WAIT = (25, 40)
