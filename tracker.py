@@ -37,7 +37,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
-
+try:
+    from curl_cffi import requests as cffi_requests
+except ImportError:          # falls back to plain requests
+    cffi_requests = None
 import requests
 from bs4 import BeautifulSoup
 
@@ -50,11 +53,14 @@ PRICES_FILE = BASE_DIR / "prices.json"
 
 MAX_HISTORY = 365            # entries kept per product
 REQUEST_TIMEOUT = 25         # seconds
-MAX_ATTEMPTS = max(1, int(os.environ.get("MAX_ATTEMPTS", "10")))  # per product
-BACKOFF_BASE = 8             # seconds; doubles every retry (8, 16, 32, 60...)
-BACKOFF_MAX = 60
-TIME_BUDGET = 20 * 60        # stop starting new products after this many seconds
-DELAY_BETWEEN_PRODUCTS = (9, 17)   # random sleep range, seconds
+MAX_ATTEMPTS = max(1, int(os.environ.get("MAX_ATTEMPTS", "12")))  # per product
+SHORT_WAIT = (3, 7)          # seconds between failed attempts (block is per-request, not rate-based)
+COOLDOWN_EVERY = 4           # after every 4th failure, take a longer pause
+COOLDOWN_WAIT = (25, 40)
+WARMUP = True                # on retries, hit amazon.in homepage first to get cookies
+TIME_BUDGET = 25 * 60
+DELAY_BETWEEN_PRODUCTS = (6, 12)
+IMPERSONATE = ["chrome124", "chrome120", "chrome119", "chrome116"]
 BIG_DROP_WARN_PCT = 50       # add a "verify" note to alerts for drops this large
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -320,37 +326,72 @@ def _is_blocked(text: str) -> bool:
     return any(marker in low for marker in BLOCK_MARKERS)
 
 
-def fetch(url: str) -> requests.Response:
-    """GET with retries. Bot-check pages are random per request, so retrying with a
-    fresh session (no cookies carried over) and a new User-Agent often succeeds."""
+def _new_session():
+    if cffi_requests is not None:
+        # impersonation sets a coherent UA + TLS + HTTP/2 fingerprint; don't override UA
+        return (cffi_requests.Session(impersonate=random.choice(IMPERSONATE)),
+                {"Accept-Language": "en-IN,en;q=0.9"})
+    return requests.Session(), _headers()
+
+
+def _scraper_api_fetch(url: str):
+    """Optional last resort. Only used if SCRAPER_API_KEY is set."""
+    key = os.environ.get("SCRAPER_API_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        r = requests.get("https://api.scraperapi.com/",
+                         params={"api_key": key, "url": url, "country_code": "in"},
+                         timeout=70)
+    except requests.RequestException:
+        return None
+    if r.status_code == 200 and not _is_blocked(r.text):
+        log.info("  succeeded via scraper API fallback")
+        return r
+    return None
+
+
+def fetch(url: str):
     last_err = "unknown error"
+    is_amazon = site_of(url) == "amazon"
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        with requests.Session() as session:
-            try:
-                resp = session.get(url, headers=_headers(), timeout=REQUEST_TIMEOUT,
+        resp = None
+        try:
+            session, headers = _new_session()
+            with session:
+                if is_amazon and WARMUP and attempt > 1:
+                    try:
+                        session.get("https://www.amazon.in/", headers=headers, timeout=15)
+                    except Exception:
+                        pass
+                    time.sleep(random.uniform(1, 2.5))
+                resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT,
                                    allow_redirects=True)
-            except requests.RequestException as exc:
-                last_err = f"network error: {exc.__class__.__name__}"
-            else:
-                if resp.status_code in (404, 410):
-                    raise FetchError(f"HTTP {resp.status_code} (product page gone?)")
-                if resp.status_code == 200 and not _is_blocked(resp.text):
-                    if attempt > 1:
-                        log.info("  succeeded on attempt %d/%d", attempt, MAX_ATTEMPTS)
-                    return resp
-                blocked = resp.status_code == 200
-                last_err = f"HTTP {resp.status_code}" + (" (bot check / captcha page)" if blocked else "")
+        except Exception as exc:
+            last_err = f"network error: {exc.__class__.__name__}"
+        else:
+            if resp.status_code in (404, 410):
+                raise FetchError(f"HTTP {resp.status_code} (product page gone?)")
+            if resp.status_code == 200 and not _is_blocked(resp.text):
+                if attempt > 1:
+                    log.info("  succeeded on attempt %d/%d", attempt, MAX_ATTEMPTS)
+                return resp
+            last_err = f"HTTP {resp.status_code}" + (
+                " (bot check / captcha page)" if resp.status_code == 200 else "")
         if attempt < MAX_ATTEMPTS:
-            wait = min(BACKOFF_MAX, BACKOFF_BASE * 2 ** (attempt - 1)) + random.uniform(0, 5)
+            wait = random.uniform(*(COOLDOWN_WAIT if attempt % COOLDOWN_EVERY == 0 else SHORT_WAIT))
             log.info("  attempt %d/%d failed (%s); retrying in %.0fs",
                      attempt, MAX_ATTEMPTS, last_err, wait)
             time.sleep(wait)
+    fallback = _scraper_api_fetch(url)
+    if fallback is not None:
+        return fallback
     raise FetchError(f"{last_err} after {MAX_ATTEMPTS} attempts")
 
 
 def check_product(url: str) -> Quote:
     resp = fetch(url)
-    site = site_of(resp.url)
+    site = site_of(str(resp.url)) or site_of(url)   # scraper API responses have a different URL
     parser = {"amazon": parse_amazon, "flipkart": parse_flipkart}.get(site or "")
     if parser is None:
         raise FetchError(f"redirected to unsupported page: {resp.url}")
