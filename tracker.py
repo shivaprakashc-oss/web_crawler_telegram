@@ -53,7 +53,8 @@ PRICES_FILE = BASE_DIR / "prices.json"
 
 MAX_HISTORY = 365            # entries kept per product
 REQUEST_TIMEOUT = 25         # seconds
-MAX_ATTEMPTS = max(1, int(os.environ.get("MAX_ATTEMPTS", "15")))  # per product
+MAX_ATTEMPTS = max(1, int(os.environ.get("MAX_ATTEMPTS", "15")))
+FLIPKART_MAX_ATTEMPTS = 6 # per product
 SHORT_WAIT = (3, 7)          # seconds between failed attempts (block is per-request, not rate-based)
 COOLDOWN_EVERY = 4           # after every 4th failure, take a longer pause
 COOLDOWN_WAIT = (25, 40)
@@ -326,12 +327,16 @@ def _is_blocked(text: str) -> bool:
     return any(marker in low for marker in BLOCK_MARKERS)
 
 
-def _new_session():
-    if cffi_requests is not None:
-        # impersonation sets a coherent UA + TLS + HTTP/2 fingerprint; don't override UA
+def _new_session(site: str, attempt: int):
+    """Amazon: always Chrome-impersonated curl_cffi (this is what fixed Amazon).
+    Flipkart: alternate plain requests (worked before) and curl_cffi."""
+    use_cffi = cffi_requests is not None
+    if site == "flipkart" and use_cffi:
+        use_cffi = (attempt % 2 == 0)       # odd attempts: requests, even: curl_cffi
+    if use_cffi:
         return (cffi_requests.Session(impersonate=random.choice(IMPERSONATE)),
-                {"Accept-Language": "en-IN,en;q=0.9"})
-    return requests.Session(), _headers()
+                {"Accept-Language": "en-IN,en;q=0.9"}, "curl_cffi")
+    return requests.Session(), _headers(), "requests"
 
 
 def _scraper_api_fetch(url: str):
@@ -353,11 +358,14 @@ def _scraper_api_fetch(url: str):
 
 def fetch(url: str):
     last_err = "unknown error"
-    is_amazon = site_of(url) == "amazon"
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    site = site_of(url)
+    is_amazon = site == "amazon"
+    max_attempts = MAX_ATTEMPTS if is_amazon else FLIPKART_MAX_ATTEMPTS
+    for attempt in range(1, max_attempts + 1):
         resp = None
+        client = "?"
         try:
-            session, headers = _new_session()
+            session, headers, client = _new_session(site or "", attempt)
             with session:
                 if is_amazon and WARMUP and attempt > 1:
                     try:
@@ -368,25 +376,24 @@ def fetch(url: str):
                 resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT,
                                    allow_redirects=True)
         except Exception as exc:
-            last_err = f"network error: {exc.__class__.__name__}"
+            last_err = f"network error: {exc.__class__.__name__} [{client}]"
         else:
             if resp.status_code in (404, 410):
                 raise FetchError(f"HTTP {resp.status_code} (product page gone?)")
             if resp.status_code == 200 and not _is_blocked(resp.text):
-                if attempt > 1:
-                    log.info("  succeeded on attempt %d/%d", attempt, MAX_ATTEMPTS)
+                log.info("  OK via %s on attempt %d/%d", client, attempt, max_attempts)
                 return resp
-            last_err = f"HTTP {resp.status_code}" + (
+            last_err = f"HTTP {resp.status_code} [{client}]" + (
                 " (bot check / captcha page)" if resp.status_code == 200 else "")
-        if attempt < MAX_ATTEMPTS:
+        if attempt < max_attempts:
             wait = random.uniform(*(COOLDOWN_WAIT if attempt % COOLDOWN_EVERY == 0 else SHORT_WAIT))
             log.info("  attempt %d/%d failed (%s); retrying in %.0fs",
-                     attempt, MAX_ATTEMPTS, last_err, wait)
+                     attempt, max_attempts, last_err, wait)
             time.sleep(wait)
     fallback = _scraper_api_fetch(url)
     if fallback is not None:
         return fallback
-    raise FetchError(f"{last_err} after {MAX_ATTEMPTS} attempts")
+    raise FetchError(f"{last_err} after {max_attempts} attempts")
 
 
 def check_product(url: str) -> Quote:
