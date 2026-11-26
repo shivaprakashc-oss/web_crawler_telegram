@@ -1,0 +1,4 @@
+# Paste one product URL per line (amazon.in or flipkart.com). Max ~15.
+# Lines starting with # are ignored.
+#
+
