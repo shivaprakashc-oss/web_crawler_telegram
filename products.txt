@@ -1,4 +1,17 @@
 # Paste one product URL per line (amazon.in or flipkart.com). Max ~15.
 # Lines starting with # are ignored.
 #
-
+#
+https://www.amazon.in/dp/B0DPQG3CJ6/?tag=pricemist-21
+https://www.amazon.in/dp/B0DPQH59DL?tag=pricemist-21&linkCode=ogi&th=1&psc=1
+https://www.amazon.in/dp/B0D5HJ2H5S/?tag=pricemist-21&th=1
+https://www.amazon.in/dp/B0D5HH92WZ?tag=pricemist-21&linkCode=ogi&th=1
+https://www.amazon.in/dp/B0DY4NF1XX/?tag=pricemist-21&th=1
+#
+https://www.amazon.in/dp/B00YMJ0OI8?tag=pricemist-21&linkCode=ogi&th=1&psc=1
+https://www.amazon.in/dp/B0FSD66V5G/?tag=pricemist-21
+https://www.amazon.in/dp/B0CMQZ98NS?tag=pricemist-21&linkCode=ogi&th=1&psc=1
+https://spendmitra.com/go/flipkart/ICTHG8ZFZVCZZE8P?src=web
+#
+https://www.flipkart.com/sigri-wala-triply-stainless-steel-kadhai-26-cm-diameter-lid-3-3-l-capacity/p/itm63fd6b7cc0090?pid=PTPH4GTD9PTKVZ4Y
+https://www.flipkart.com/fastrack-revoltt-xr1-1-38-bt-calling-fast-charge-100-sports-mode-ip68-calculator-fashion-smartwatch/p/itm470880e507472?pid=PTPGYDFWSD9YWQFZ
