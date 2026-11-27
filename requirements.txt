@@ -2,3 +2,5 @@ requests
 beautifulsoup4
 lxml
 curl_cffi>=0.7.0
+tls-client
+primp
