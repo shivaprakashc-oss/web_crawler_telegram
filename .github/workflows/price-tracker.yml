@@ -2,7 +2,9 @@ name: Price tracker
 
 on:
   schedule:
-    - cron: "30 3 * * *"      # 03:30 UTC = 09:00 IST, daily (GitHub may delay by a few minutes)
+    - cron: "47 1 * * *"       # 01:47 UTC = 07:17 IST (Morning)
+    - cron: "47 9 * * *"       # 09:47 UTC = 15:17 IST (Afternoon)
+    - cron: "47 17 * * *"      # 17:47 UTC = 23:17 IST (Night)
   workflow_dispatch:           # manual "Run workflow" button
 
 permissions:
