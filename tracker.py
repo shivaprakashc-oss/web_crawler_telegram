@@ -37,10 +37,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
-try:
-    from curl_cffi import requests as cffi_requests
-except ImportError:          # falls back to plain requests
-    cffi_requests = None
+from curl_cffi import requests as cffi_requests
+import primp
+import tls_client
 import requests
 from bs4 import BeautifulSoup
 
@@ -53,13 +52,15 @@ PRICES_FILE = BASE_DIR / "prices.json"
 
 MAX_HISTORY = 365            # entries kept per product
 REQUEST_TIMEOUT = 25         # seconds
-MAX_ATTEMPTS = max(1, int(os.environ.get("MAX_ATTEMPTS", "15")))
-FLIPKART_MAX_ATTEMPTS = 6 # per product
+MAX_ATTEMPTS = max(1, int(os.environ.get("MAX_ATTEMPTS", "16")))   # Amazon: 4 full rotations
+FLIPKART_MAX_ATTEMPTS = 8                                           # 2 full rotations
+TIME_BUDGET = 35 * 60
+TLS_CLIENT_IDS = ["chrome_120", "chrome_117", "chrome_112"]
+PRIMP_IMPERSONATE = ["chrome_131", "chrome_130", "chrome_128", "chrome_126", "chrome_124"]
 SHORT_WAIT = (3, 7)          # seconds between failed attempts (block is per-request, not rate-based)
 COOLDOWN_EVERY = 4           # after every 4th failure, take a longer pause
 COOLDOWN_WAIT = (25, 40)
 WARMUP = True                # on retries, hit amazon.in homepage first to get cookies
-TIME_BUDGET = 25 * 60
 DELAY_BETWEEN_PRODUCTS = (6, 12)
 IMPERSONATE = ["chrome124", "chrome120", "chrome119", "chrome116"]
 BIG_DROP_WARN_PCT = 50       # add a "verify" note to alerts for drops this large
@@ -110,7 +111,15 @@ log = logging.getLogger("price-tracker")
 
 
 class FetchError(Exception):
-    """Raised when a page cannot be fetched or a price cannot be extracted."""
+    """Page could not be fetched (blocked, 5xx, network...). Old price is kept."""
+
+
+class NotFoundError(FetchError):
+    """404/410: product page gone. Never retried."""
+
+
+class ParseError(FetchError):
+    """Page fetched but price could not be parsed. History is not updated."""
 
 
 @dataclass
@@ -320,92 +329,129 @@ def _headers() -> dict:
 
 
 def _is_blocked(text: str) -> bool:
-    # Real product pages are large; bot-check pages are small.
-    if len(text) > 60_000:
+    if len(text) > 60_000:          # real product pages are large
         return False
     low = text.lower()
     return any(marker in low for marker in BLOCK_MARKERS)
 
 
-def _new_session(site: str, attempt: int):
-    """Amazon: always Chrome-impersonated curl_cffi (this is what fixed Amazon).
-    Flipkart: alternate plain requests (worked before) and curl_cffi."""
-    use_cffi = cffi_requests is not None
-    if site == "flipkart" and use_cffi:
-        use_cffi = (attempt % 2 == 0)       # odd attempts: requests, even: curl_cffi
-    if use_cffi:
-        return (cffi_requests.Session(impersonate=random.choice(IMPERSONATE)),
-                {"Accept-Language": "en-IN,en;q=0.9"}, "curl_cffi")
-    return requests.Session(), _headers(), "requests"
+@dataclass
+class Page:
+    status: int
+    text: str
+    url: str
 
 
-def _scraper_api_fetch(url: str):
-    """Optional last resort. Only used if SCRAPER_API_KEY is set."""
-    key = os.environ.get("SCRAPER_API_KEY", "").strip()
-    if not key:
-        return None
+# ---- client factories: each returns (session, headers, get_kwargs) ---------
+def _make_curl_cffi():
+    s = cffi_requests.Session(impersonate=random.choice(IMPERSONATE))
+    return s, {"Accept-Language": "en-IN,en;q=0.9"}, {
+        "timeout": REQUEST_TIMEOUT, "allow_redirects": True}
+
+
+def _make_tls_client():
+    s = tls_client.Session(client_identifier=random.choice(TLS_CLIENT_IDS),
+                           random_tls_extension_order=True)
+    headers = _headers()
+    headers["User-Agent"] = USER_AGENTS[0]          # Chrome UA to match Chrome TLS
+    return s, headers, {"timeout_seconds": REQUEST_TIMEOUT, "allow_redirects": True}
+
+
+def _make_primp():
+    last_exc = None
+    for imp in random.sample(PRIMP_IMPERSONATE, len(PRIMP_IMPERSONATE)):
+        try:
+            s = primp.Client(impersonate=imp, timeout=REQUEST_TIMEOUT)
+            return s, {"Accept-Language": "en-IN,en;q=0.9"}, {}
+        except Exception as exc:                    # unsupported profile in this version
+            last_exc = exc
+    raise RuntimeError(f"primp has no usable profile: {last_exc}")
+
+
+def _make_requests():
+    return requests.Session(), _headers(), {
+        "timeout": REQUEST_TIMEOUT, "allow_redirects": True}
+
+
+# Order = rotation order. curl_cffi is always first (primary).
+CLIENTS = [
+    ("curl_cffi", cffi_requests is not None, _make_curl_cffi),
+    ("tls-client", tls_client is not None, _make_tls_client),
+    ("primp", primp is not None, _make_primp),
+    ("requests", True, _make_requests),
+]
+
+
+def _close(session) -> None:
     try:
-        r = requests.get("https://api.scraperapi.com/",
-                         params={"api_key": key, "url": url, "country_code": "in"},
-                         timeout=70)
-    except requests.RequestException:
-        return None
-    if r.status_code == 200 and not _is_blocked(r.text):
-        log.info("  succeeded via scraper API fallback")
-        return r
-    return None
+        session.close()
+    except Exception:
+        pass
 
 
-def fetch(url: str):
-    last_err = "unknown error"
+def fetch(url: str) -> Page:
+    """Rotate clients per attempt: curl_cffi -> tls-client -> primp -> requests -> repeat.
+    Captcha/bot pages, 5xx, 429 and network errors are retried with the next client.
+    404/410 stop immediately."""
     site = site_of(url)
     is_amazon = site == "amazon"
     max_attempts = MAX_ATTEMPTS if is_amazon else FLIPKART_MAX_ATTEMPTS
+    clients = [(n, mk) for n, ok, mk in CLIENTS if ok]
+    if not clients:
+        raise FetchError("no HTTP client library available")
+    last_err = "unknown error"
+
     for attempt in range(1, max_attempts + 1):
-        resp = None
-        client = "?"
+        name, maker = clients[(attempt - 1) % len(clients)]
+        session = None
         try:
-            session, headers, client = _new_session(site or "", attempt)
-            with session:
-                if is_amazon and WARMUP and attempt > 1:
-                    try:
-                        session.get("https://www.amazon.in/", headers=headers, timeout=15)
-                    except Exception:
-                        pass
-                    time.sleep(random.uniform(1, 2.5))
-                resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT,
-                                   allow_redirects=True)
+            session, headers, kwargs = maker()
+            if is_amazon and WARMUP and attempt > 1:
+                try:
+                    session.get("https://www.amazon.in/", headers=headers, **kwargs)
+                except Exception:
+                    pass
+                time.sleep(random.uniform(1, 2.5))
+            resp = session.get(url, headers=headers, **kwargs)
+            status = int(resp.status_code)
+            text = resp.text or ""
+            final_url = str(getattr(resp, "url", "") or url)
         except Exception as exc:
-            last_err = f"network error: {exc.__class__.__name__} [{client}]"
+            last_err = f"network/client error: {exc.__class__.__name__} [{name}]"
         else:
-            if resp.status_code in (404, 410):
-                raise FetchError(f"HTTP {resp.status_code} (product page gone?)")
-            if resp.status_code == 200 and not _is_blocked(resp.text):
-                log.info("  OK via %s on attempt %d/%d", client, attempt, max_attempts)
-                return resp
-            last_err = f"HTTP {resp.status_code} [{client}]" + (
-                " (bot check / captcha page)" if resp.status_code == 200 else "")
+            if status in (404, 410):
+                raise NotFoundError(f"HTTP {status} (product page unavailable)")
+            if status == 200 and not _is_blocked(text):
+                log.info("  OK via %s on attempt %d/%d", name, attempt, max_attempts)
+                return Page(status, text, final_url)
+            last_err = f"HTTP {status} [{name}]" + (
+                " (bot check / captcha page)" if status == 200 else "")
+        finally:
+            if session is not None:
+                _close(session)
+
         if attempt < max_attempts:
-            wait = random.uniform(*(COOLDOWN_WAIT if attempt % COOLDOWN_EVERY == 0 else SHORT_WAIT))
-            log.info("  attempt %d/%d failed (%s); retrying in %.0fs",
+            full_round_done = attempt % len(clients) == 0
+            wait = random.uniform(*(COOLDOWN_WAIT if full_round_done else SHORT_WAIT))
+            log.info("  attempt %d/%d failed (%s); next client in %.0fs",
                      attempt, max_attempts, last_err, wait)
             time.sleep(wait)
-    fallback = _scraper_api_fetch(url)
-    if fallback is not None:
-        return fallback
     raise FetchError(f"{last_err} after {max_attempts} attempts")
 
 
 def check_product(url: str) -> Quote:
-    resp = fetch(url)
-    site = site_of(str(resp.url)) or site_of(url)   # scraper API responses have a different URL
+    page = fetch(url)
+    site = site_of(page.url) or site_of(url)
     parser = {"amazon": parse_amazon, "flipkart": parse_flipkart}.get(site or "")
     if parser is None:
-        raise FetchError(f"redirected to unsupported page: {resp.url}")
-    soup = BeautifulSoup(resp.text, "lxml")
-    title, price, unavailable = parser(soup)
+        raise FetchError(f"redirected to unsupported page: {page.url}")
+    try:
+        soup = BeautifulSoup(page.text, "lxml")
+        title, price, unavailable = parser(soup)
+    except Exception as exc:
+        raise ParseError(f"parser crashed: {exc.__class__.__name__}") from None
     if price is None and not unavailable:
-        raise FetchError("price not found (layout changed, or page served without price)")
+        raise ParseError("price not found (layout changed, or page served without price)")
     return Quote(site=site, title=title[:150], price=price, unavailable=unavailable)
 
 
@@ -486,6 +532,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log.info("Clients available: %s", ", ".join(n for n, ok, _ in CLIENTS if ok))
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -503,8 +550,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     data = load_prices()
-    failures = 0
-    alert_failures = 0
+    fetch_failures = parse_failures = not_found = skipped = alert_failures = 0
     started = time.monotonic()
     seen: set[str] = set()
     now = datetime.now(IST)
@@ -513,19 +559,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     for i, raw in enumerate(raw_urls):
         try:
             key = normalize_url(raw)
-        except RuntimeError as exc:
-                # Do NOT store the new price: next run will detect the drop again.
-                log.error("  alert failed, keeping old price so it retries tomorrow: %s", exc)
-                alert_failures += 1
-                continue
+        except ValueError as exc:
+            log.warning("SKIP: %s", exc)
+            skipped += 1
+            continue
         if key in seen:
             continue
         seen.add(key)
 
         if time.monotonic() - started > TIME_BUDGET:
             left = len(raw_urls) - i
-            log.error("Time budget exceeded; %d product(s) not checked this run.", left)
-            failures += left
+            log.warning("Time budget exceeded; %d product(s) not checked this run.", left)
+            fetch_failures += left
             break
 
         if len(seen) > 1:
@@ -534,13 +579,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         log.info("[%d/%d] %s", i + 1, len(raw_urls), key)
         try:
             quote = check_product(key)
-        except FetchError as exc:
-            log.warning("  could not check this product today: %s", exc)
-            failures += 1
+        except NotFoundError as exc:
+            log.warning("  product page unavailable, not retrying: %s", exc)
+            not_found += 1
             continue
-        except Exception:  # one bad product must never kill the whole run
-            log.exception("  UNEXPECTED ERROR")
-            failures += 1
+        except ParseError as exc:
+            log.warning("  PARSING FAILURE (history not updated): %s", exc)
+            parse_failures += 1
+            continue
+        except FetchError as exc:
+            log.warning("  fetch failed, old price kept: %s", exc)
+            fetch_failures += 1
+            continue
+        except Exception:
+            log.exception("  unexpected error, old price kept")
+            fetch_failures += 1
             continue
 
         if quote.unavailable or quote.price is None:
@@ -563,14 +616,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                     send_telegram(token, chat_id, message)
                 log.info("  price drop alert sent")
             except RuntimeError as exc:
-                # Do NOT store the new price: next run will detect the drop again.
+                # Old price is kept, so the drop is detected again next run.
                 log.error("  alert failed, keeping old price so it retries tomorrow: %s", exc)
-                failures += 1
+                alert_failures += 1
                 continue
 
         history = entry.get("history", [])
         if history and history[-1].get("date") == today:
-            history[-1]["price"] = new          # re-run on the same day: overwrite
+            history[-1]["price"] = new
         else:
             history.append({"date": today, "price": new})
 
@@ -582,13 +635,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             "last_checked": now.isoformat(timespec="seconds"),
             "history": history[-MAX_HISTORY:],
         }
-        save_prices(data)   # save per product so a crash never loses sent-alert state
+        save_prices(data)
 
     save_prices(data)
-    log.info("Done. %d product(s) checked, %d could not be fetched (ignored), %d alert failure(s).",
-             len(seen), failures, alert_failures)
+    log.info("Done. %d checked | fetch failed: %d | parse failed: %d | 404: %d | skipped: %d | alert failures: %d",
+             len(seen), fetch_failures, parse_failures, not_found, skipped, alert_failures)
     return 1 if alert_failures else 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
